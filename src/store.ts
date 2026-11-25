@@ -541,6 +541,23 @@ export class Store {
     return { document: this.#documentInfo(document), revision: this.#info(revision), thread: view };
   }
 
+  /**
+   * Moves a tracked document from `from` to `to`, threads and revisions with
+   * it. Ids stay. Archiving a spec is this plus the file move. Refuses a key
+   * that is already tracked, so two documents never collapse into one.
+   */
+  renameDocument(type: string, from: string, to: string): void {
+    if (!type || !from || !to) throw new StoreError("A document needs a type and two keys.");
+    this.#transaction(() => {
+      const document = this.document(type, from);
+      if (!document) throw new StoreError(`No tracked document "${from}".`);
+      if (from === to) return;
+      if (this.document(type, to)) throw new StoreError(`A document is already tracked at "${to}".`);
+      this.#run("UPDATE documents SET key = ? WHERE id = ?", to, document.id);
+      this.#wrote();
+    });
+  }
+
   /** The document a thread is on, so callers can observe it before acting. */
   documentOf(threadId: number): { type: string; key: string } {
     const document = this.#documentById(this.#threadRow(threadId).document_id);
