@@ -4,4 +4,7 @@ export { CORE_MIGRATIONS, migrate } from "./schema.ts";
 export { extractBlocks, markdownBlock } from "./anchors/markdown-block.ts";
 export { filterSql } from "./filter.ts";
 export { findFolder, homeVariable, prepareFolder } from "./folder.ts";
-export { openStore, Store, STATUS_LABELS, STORE_FILE } from "./store.ts";
+export { doSqlite, type Db, type DoSqliteStorage, type SqlValue } from "./db.ts";
+export { nodeSqlite } from "./db-node.ts";
+export { openPeanutStore, PeanutStore } from "./peanut-store.ts";
+export { openStore, openStoreOn, Store, STATUS_LABELS, STORE_FILE } from "./store.ts";
