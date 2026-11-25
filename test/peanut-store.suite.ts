@@ -143,6 +143,80 @@ export function registerPeanutTests(h: PeanutHarness): void {
     assert.equal((await store.thread(b)).thread.status, "suggested");
   });
 
+  h.test("renameDocument carries threads and revisions to the new key", async () => {
+    const store = await h.open();
+    const made = {
+      type: "notes.page",
+      anchorType: "markdown.block",
+      author: HUMAN,
+    };
+    const id = await store.createThread({ ...made, key: "proj/a.md", content: PLAN, spec: { quote: "drifted apart" }, body: "Why?" });
+    await store.reply(id, "Because.", AGENT);
+    await store.observe("notes.page", "proj/a.md", { content: `${PLAN}\nMore.\n` });
+    const beforeToken = await store.changeToken();
+    const before = await store.thread(id);
+    const revisions = await store.revisions("notes.page", "proj/a.md");
+    assert.deepEqual(revisions.map((r) => r.seq), [2, 1]);
+
+    await store.renameDocument("notes.page", "proj/a.md", "proj/archive/a.md");
+
+    assert.equal(await store.document("notes.page", "proj/a.md"), null);
+    const moved = await store.document("notes.page", "proj/archive/a.md");
+    assert.equal(moved?.key, "proj/archive/a.md");
+    const after = await store.thread(id);
+    assert.equal(after.document.key, "proj/archive/a.md");
+    assert.equal(after.thread.id, before.thread.id);
+    assert.equal(after.thread.state, before.thread.state);
+    assert.equal(after.thread.madeOn.seq, before.thread.madeOn.seq);
+    assert.equal(after.revision.seq, 2);
+    assert.deepEqual(after.thread.messages.map((m) => [m.id, m.body]), before.thread.messages.map((m) => [m.id, m.body]));
+    const movedRevisions = await store.revisions("notes.page", "proj/archive/a.md");
+    assert.deepEqual(
+      movedRevisions.map((r) => [r.id, r.seq, r.sha256, r.content, r.threads]),
+      revisions.map((r) => [r.id, r.seq, r.sha256, r.content, r.threads]),
+    );
+    assert.equal((await store.revisions("notes.page", "proj/a.md")).length, 0);
+    assert.notEqual(await store.changeToken(), beforeToken);
+  });
+
+  h.test("renameDocument refuses a missing source and an occupied target", async () => {
+    const store = await h.open();
+    const made = {
+      type: "notes.page",
+      key: "proj/a.md",
+      content: PLAN,
+      anchorType: "markdown.block",
+      spec: { quote: "drifted apart" },
+      body: "Why?",
+      author: HUMAN,
+    };
+    const id = await store.createThread(made);
+    await store.createThread({ ...made, key: "proj/b.md", spec: { quote: "One library" }, body: "And?" });
+    await assert.rejects(() => store.renameDocument("notes.page", "proj/missing.md", "proj/c.md"), /No tracked document/);
+    await assert.rejects(() => store.renameDocument("notes.page", "proj/a.md", "proj/b.md"), /already tracked/);
+    assert.equal((await store.document("notes.page", "proj/a.md"))?.key, "proj/a.md");
+    assert.equal((await store.thread(id)).document.key, "proj/a.md");
+    assert.equal((await store.document("notes.page", "proj/b.md"))?.key, "proj/b.md");
+  });
+
+  h.test("a replayed renameDocument does not move the document again", async () => {
+    const store = await h.open();
+    await store.createThread({
+      type: "notes.page",
+      key: "proj/a.md",
+      content: PLAN,
+      anchorType: "markdown.block",
+      spec: { quote: "drifted apart" },
+      body: "Why?",
+      author: HUMAN,
+      requestId: "create-move",
+    });
+    await store.renameDocument("notes.page", "proj/a.md", "proj/archive/a.md", { requestId: "move-1" });
+    await store.renameDocument("notes.page", "proj/archive/a.md", "proj/elsewhere.md", { requestId: "move-1" });
+    assert.equal((await store.document("notes.page", "proj/archive/a.md"))?.key, "proj/archive/a.md");
+    assert.equal(await store.document("notes.page", "proj/elsewhere.md"), null);
+  });
+
   h.test("an empty requestId is refused", async () => {
     const store = await h.open();
     await assert.rejects(

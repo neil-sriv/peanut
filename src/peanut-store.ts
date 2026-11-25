@@ -141,6 +141,11 @@ export class PeanutStore {
     return this.#store.documentOf(threadId);
   }
 
+  /** Moves a tracked document to a new key. Threads and revisions keep their ids. */
+  async renameDocument(type: string, from: string, to: string, options: { requestId?: string } = {}): Promise<void> {
+    return this.#once(options.requestId, () => this.#store.renameDocument(type, from, to));
+  }
+
   async write<T>(fn: (db: Store["db"]) => T, options: { requestId?: string } = {}): Promise<T> {
     return this.#once(options.requestId, () => this.#store.write(fn));
   }
