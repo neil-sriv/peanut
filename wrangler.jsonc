@@ -1,0 +1,12 @@
+{
+  // Test harness only. Vitest boots this in Miniflare; it is not deployed.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "peanut-do-tests",
+  "compatibility_date": "2026-11-25",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "do-tests/worker.ts",
+  "durable_objects": {
+    "bindings": [{ "name": "STORE", "class_name": "PeanutStoreDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PeanutStoreDO"] }]
+}

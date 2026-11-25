@@ -12,6 +12,8 @@
  * It is unchanged from mdview's and diffview's stores.
  */
 import type { DatabaseSync } from "node:sqlite";
+import { isDb, type Db } from "./db.ts";
+import { wrapNode } from "./db-node.ts";
 import type { Registry } from "./registry.ts";
 
 /** The core's steps. Append; never edit a step that has shipped. */
@@ -90,20 +92,19 @@ const MIGRATIONS_TABLE = `CREATE TABLE IF NOT EXISTS migrations (
 /**
  * Brings the core's and every registered app's tables up to date, in one
  * transaction, and returns the steps it ran as ["core:1", "diffview:1", ...].
- * `db` is a node:sqlite DatabaseSync.
+ * `db` is a node:sqlite DatabaseSync, or a Db (the Durable Object driver).
  */
-export function migrate(db: DatabaseSync, registry: Registry): string[] {
+export function migrate(db: DatabaseSync | Db, registry: Registry): string[] {
+  return migrateDb(isDb(db) ? db : wrapNode(db), registry);
+}
+
+function migrateDb(db: Db, registry: Registry): string[] {
   const namespaces: [string, readonly string[]][] = [["core", CORE_MIGRATIONS], ...registry.apps().map((app): [string, readonly string[]] => [app.name, app.migrations])];
   const ran: string[] = [];
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  db.transaction(() => {
     db.exec(MIGRATIONS_TABLE);
-    const read = db.prepare("SELECT version FROM migrations WHERE namespace = ?");
-    const write = db.prepare(
-      "INSERT INTO migrations (namespace, version) VALUES (?, ?) ON CONFLICT (namespace) DO UPDATE SET version = excluded.version",
-    );
     for (const [namespace, steps] of namespaces) {
-      const done = Number(read.get(namespace)?.version ?? 0);
+      const done = Number(db.get<{ version: number }>("SELECT version FROM migrations WHERE namespace = ?", namespace)?.version ?? 0);
       if (done > steps.length) {
         throw new Error(`The store has ${done} "${namespace}" migrations, more than this code knows (${steps.length}). Is an older ${namespace} running?`);
       }
@@ -111,12 +112,14 @@ export function migrate(db: DatabaseSync, registry: Registry): string[] {
         db.exec(steps[i]!);
         ran.push(`${namespace}:${i + 1}`);
       }
-      if (steps.length > done) write.run(namespace, steps.length);
+      if (steps.length > done) {
+        db.run(
+          "INSERT INTO migrations (namespace, version) VALUES (?, ?) ON CONFLICT (namespace) DO UPDATE SET version = excluded.version",
+          namespace,
+          steps.length,
+        );
+      }
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+  });
   return ran;
 }

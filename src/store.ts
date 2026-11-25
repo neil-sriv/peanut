@@ -11,7 +11,11 @@
  *
  * The viewer and any number of CLI processes share the file. WAL mode and a
  * busy timeout serialize their writes, and BEGIN IMMEDIATE keeps two writers
- * from claiming the same revision number.
+ * from claiming the same revision number. Those pragmas live in the node
+ * driver (db-node.ts). The same statements run on a Durable Object through
+ * doSqlite, whose SQLite rejects them and takes transactions with
+ * transactionSync. PeanutStore (peanut-store.ts) is that store as async
+ * methods a Durable Object RPC can call.
  *
  * Deleting is permanent and human-only. The CLI that agents use has no
  * delete verb, so in practice only the viewer deletes.
@@ -25,10 +29,13 @@
  */
 import { createHash } from "node:crypto";
 import path from "node:path";
-import type { DatabaseSync, SQLInputValue } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
+import { isDb, type Db, type SqlValue } from "./db.ts";
+import { nodeSqlite, wrapNode } from "./db-node.ts";
 import { StoreError } from "./errors.ts";
 import { filterSql } from "./filter.ts";
 import type { Registry } from "./registry.ts";
+import { decodeResult, encodeResult, REQUESTS_TABLE } from "./requests.ts";
 import { migrate } from "./schema.ts";
 import type {
   Author,
@@ -44,7 +51,6 @@ import type {
 } from "./types.ts";
 
 export const STORE_FILE = "peanut.sqlite3";
-const BUSY_TIMEOUT_MS = 5000;
 
 export const STATUS_LABELS: Record<Status, string> = { open: "open", suggested: "suggested resolved", resolved: "resolved" };
 
@@ -154,24 +160,54 @@ function now(): string {
  * import time.
  */
 export async function openStore({ registry, dir }: { registry: Registry; dir: string }): Promise<Store> {
-  const { DatabaseSync } = await import("node:sqlite");
-  const db = new DatabaseSync(path.join(dir, STORE_FILE));
-  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
-  db.exec("PRAGMA journal_mode = WAL");
+  return openStoreOn(await nodeSqlite(path.join(dir, STORE_FILE)), registry);
+}
+
+/**
+ * Migrates `db` and returns the store on it. openStore() uses this for the
+ * file; a Durable Object uses it for doSqlite(ctx.storage).
+ */
+export function openStoreOn(db: Db, registry: Registry): Store {
   migrate(db, registry);
-  db.exec("PRAGMA foreign_keys = ON");
+  enableForeignKeys(db);
   return new Store(db, registry);
 }
 
+function enableForeignKeys(db: Db): void {
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+  } catch (err) {
+    // Node always accepts this. The schema spike found Durable Object SQLite
+    // accepts it too; if a runtime rejects it, foreign keys stay at the
+    // engine default instead of refusing to open.
+    if (db.kind === "node") throw err;
+  }
+}
+
+interface PeerWrites {
+  sharedWrites(): number;
+  setSharedWrites(n: number): void;
+}
+
 export class Store {
-  #db: DatabaseSync;
+  #db: Db;
+  /** The node:sqlite handle, when this store has one. Apps prepare() their own statements on it. */
+  #sqlite: DatabaseSync | undefined;
+  #facade: DatabaseSync | undefined;
   #registry: Registry;
   #writes = 0;
+  /** Set only for doSqlite, so two handles on one Durable Object share a change token. */
+  #peer: PeerWrites | undefined;
   #listeners = new Set<() => void>();
+  /** Set by withRequest while a write runs, so the transaction can record its result. */
+  #requestId: string | undefined;
 
-  constructor(db: DatabaseSync, registry: Registry) {
-    this.#db = db;
+  constructor(db: DatabaseSync | Db, registry: Registry) {
+    const driver = isDb(db) ? db : wrapNode(db);
+    this.#db = driver;
     this.#registry = registry;
+    this.#sqlite = nodeHandle(driver);
+    this.#peer = peerWrites(driver);
   }
 
   close(): void {
@@ -180,7 +216,8 @@ export class Store {
 
   /** The SQLite handle, for reading an app's own tables. Write them with write(), so readers hear about it. */
   get db(): DatabaseSync {
-    return this.#db;
+    if (this.#sqlite) return this.#sqlite;
+    return (this.#facade ??= facadeFor(this.#db));
   }
 
   /**
@@ -191,14 +228,45 @@ export class Store {
    */
   write<T>(fn: (db: DatabaseSync) => T): T {
     return this.#transaction(() => {
-      this.#writes++;
-      return fn(this.#db);
+      this.#wrote();
+      return fn(this.db);
     });
+  }
+
+  /**
+   * Runs `fn` once per `requestId`. A later call with the same id returns the
+   * first result and does not write again. PeanutStore uses this; a store
+   * opened with openStore() has no requests table, so it never sets an id.
+   * The result must be JSON. An empty id is refused so every write does not
+   * collapse onto one row.
+   */
+  withRequest<T>(requestId: string | undefined, fn: () => T): T {
+    if (requestId === undefined) return fn();
+    if (!requestId.trim()) throw new StoreError("A requestId must not be empty.");
+    const prior = this.#readRequest(requestId);
+    if (prior.hit) return prior.value as T;
+    this.#requestId = requestId;
+    try {
+      return fn();
+    } catch (err) {
+      // A second process can commit the same id between the read and the
+      // insert. Its row wins; ours rolled back with the failed insert.
+      const raced = this.#readRequest(requestId);
+      if (raced.hit) return raced.value as T;
+      throw err;
+    } finally {
+      this.#requestId = undefined;
+    }
   }
 
   /** Changes whenever this process or another one writes to the store. */
   changeToken(): string {
-    return `${this.#get<{ data_version: number }>("PRAGMA data_version")!.data_version}:${this.#writes}`;
+    // Node: data_version moves when another process commits, #writes when
+    // this one does. A Durable Object has one connection, so data_version
+    // does not see the other handle; #peer is that handle's shared count.
+    const version = this.#dataVersion();
+    const writes = this.#peer ? this.#peer.sharedWrites() : this.#writes;
+    return `${version}:${writes}`;
   }
 
   /** Calls `listener` after each write this process commits. Returns a function that stops it. */
@@ -275,7 +343,7 @@ export class Store {
         now(),
       )!;
       this.#insertMessage(thread.id, revision.id, body, author, pending);
-      this.#writes++;
+      this.#wrote();
       return Number(thread.id);
     });
   }
@@ -293,7 +361,7 @@ export class Store {
       const thread = this.#visibleThreadRow(threadId, author);
       this.#insertMessage(thread.id, this.#latestRevision(thread.document_id)!.id, body, author, pending || Boolean(thread.draft));
       if (author.kind === "human" && thread.status === "suggested") this.#updateStatus(thread.id, "open", author);
-      this.#writes++;
+      this.#wrote();
     });
   }
 
@@ -321,7 +389,7 @@ export class Store {
         if ("reply" in action && Number.isInteger(action.reply)) {
           const thread = this.#visibleThreadRow(action.reply, author);
           this.#insertMessage(thread.id, this.#latestRevision(thread.document_id)!.id, action.message, author, false);
-          this.#writes++;
+          this.#wrote();
         } else if ("suggestResolve" in action && Number.isInteger(action.suggestResolve)) {
           this.#setStatus(action.suggestResolve, "suggested", author, action.message, { pending: false });
         } else {
@@ -348,7 +416,7 @@ export class Store {
       const latest = this.#get<{ at: string | null }>("SELECT max(sent_at) AS at FROM messages")!.at;
       const at = new Date(Math.max(Date.now(), latest ? Date.parse(latest) + 1 : 0)).toISOString();
       const changes = Number(this.#run("UPDATE messages SET sent_at = ? WHERE sent_at IS NULL", at));
-      if (changes) this.#writes++;
+      if (changes) this.#wrote();
       return changes;
     });
   }
@@ -362,7 +430,7 @@ export class Store {
       );
       const count = Number(this.#run("DELETE FROM messages WHERE sent_at IS NULL"));
       for (const draft of drafts) this.#deleteThreadRows(draft.id, draft.document_id);
-      if (count) this.#writes++;
+      if (count) this.#wrote();
       return count;
     });
   }
@@ -377,7 +445,7 @@ export class Store {
     this.#transaction(() => {
       const thread = this.#threadRow(threadId);
       this.#deleteThreadRows(thread.id, thread.document_id);
-      this.#writes++;
+      this.#wrote();
     });
   }
 
@@ -390,7 +458,7 @@ export class Store {
       if (!message) throw new StoreError(`Thread #${thread.id} has no message ${messageId}.`);
       if (message.id === thread.first_message_id) throw new StoreError("The first message is the comment itself. Delete the thread instead.");
       this.#run("DELETE FROM messages WHERE id = ?", message.id);
-      this.#writes++;
+      this.#wrote();
     });
   }
 
@@ -479,35 +547,67 @@ export class Store {
     return { type: document.type, key: document.key };
   }
 
-  // node:sqlite types every row as Record<string, SQLOutputValue>. These name the shape each query returns.
-  #get<T>(sql: string, ...params: SQLInputValue[]): T | undefined {
-    return this.#db.prepare(sql).get(...params) as T | undefined;
+  // Rows come back named as each query aliases them. node:sqlite's have a null prototype; #info copies the ones callers keep.
+  #get<T>(sql: string, ...params: SqlValue[]): T | undefined {
+    return this.#db.get<T>(sql, ...params);
   }
 
-  #all<T>(sql: string, ...params: SQLInputValue[]): T[] {
-    return this.#db.prepare(sql).all(...params) as T[];
+  #all<T>(sql: string, ...params: SqlValue[]): T[] {
+    return this.#db.all<T>(sql, ...params);
   }
 
   /** Runs a write and returns how many rows it changed. */
-  #run(sql: string, ...params: SQLInputValue[]): number | bigint {
-    return this.#db.prepare(sql).run(...params).changes;
+  #run(sql: string, ...params: SqlValue[]): number {
+    return this.#db.run(sql, ...params).changes;
   }
 
   /** Runs `fn` under the write lock. Listeners hear about its writes only after they commit. */
   #transaction<T>(fn: () => T): T {
     const before = this.#writes;
-    this.#db.exec("BEGIN IMMEDIATE");
-    let result: T;
+    const beforePeer = this.#peer?.sharedWrites();
     try {
-      result = fn();
-      this.#db.exec("COMMIT");
+      const result = this.#db.transaction(() => {
+        const value = fn();
+        this.#remember(value);
+        return value;
+      });
+      if (this.#writes !== before) for (const listener of this.#listeners) listener();
+      return result;
     } catch (err) {
-      this.#db.exec("ROLLBACK");
       this.#writes = before;
+      if (beforePeer !== undefined) this.#peer?.setSharedWrites(beforePeer);
       throw err;
     }
-    if (this.#writes !== before) for (const listener of this.#listeners) listener();
-    return result;
+  }
+
+  #wrote(): void {
+    this.#writes++;
+    if (this.#peer) this.#peer.setSharedWrites(this.#peer.sharedWrites() + 1);
+  }
+
+  #dataVersion(): number {
+    try {
+      return Number(this.#get<{ data_version: number }>("PRAGMA data_version")?.data_version ?? 0);
+    } catch {
+      return 0;
+    }
+  }
+
+  #readRequest(id: string): { hit: true; value: unknown } | { hit: false } {
+    const row = this.#get<{ result: string | null }>(`SELECT result FROM ${REQUESTS_TABLE} WHERE id = ?`, id);
+    if (!row) return { hit: false };
+    return { hit: true, value: decodeResult(row.result) };
+  }
+
+  /** Records the open requestId's result in the transaction `fn` already holds. */
+  #remember(value: unknown): void {
+    if (!this.#requestId) return;
+    this.#run(
+      `INSERT INTO ${REQUESTS_TABLE} (id, result, created_at) VALUES (?, ?, ?)`,
+      this.#requestId,
+      encodeResult(value),
+      now(),
+    );
   }
 
   #setStatus(threadId: number, status: Status, author: Author, body: string | undefined, { pending }: { pending: boolean }): void {
@@ -530,7 +630,7 @@ export class Store {
     const message = body?.trim() || (status === "open" ? "Reopened." : "");
     if (message) this.#insertMessage(thread.id, this.#latestRevision(thread.document_id)!.id, message, author, pending || Boolean(thread.draft));
     this.#updateStatus(thread.id, status, author);
-    this.#writes++;
+    this.#wrote();
   }
 
   /** Returns the document's latest revision, inserting `input` as the next one when its content differs. */
@@ -539,7 +639,7 @@ export class Store {
     const latest = this.#latestRevision(documentId);
     // Only the content is what threads are on: a change to meta alone (a rebase that moves no code) is not a revision.
     if (latest?.sha256 === sha) return latest;
-    this.#writes++;
+    this.#wrote();
     return this.#get<RevisionRow>(
       "INSERT INTO revisions (document_id, seq, sha256, content, meta, observed_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
       documentId,
@@ -709,4 +809,39 @@ export class Store {
       return view;
     });
   }
+}
+
+function nodeHandle(db: Db): DatabaseSync | undefined {
+  if (db.kind !== "node") return undefined;
+  return (db as Db & { sqlite: DatabaseSync }).sqlite;
+}
+
+function peerWrites(db: Db): PeerWrites | undefined {
+  const candidate = db as Db & Partial<PeerWrites>;
+  if (typeof candidate.sharedWrites !== "function" || typeof candidate.setSharedWrites !== "function") return undefined;
+  return candidate as PeerWrites;
+}
+
+/** prepare/get/run for a driver that is not node:sqlite, so app tables can be read the same way. */
+function facadeFor(db: Db): DatabaseSync {
+  const facade = {
+    prepare(sql: string) {
+      return {
+        get: (...params: SqlValue[]) => db.get(sql, ...params),
+        all: (...params: SqlValue[]) => db.all(sql, ...params),
+        run: (...params: SqlValue[]) => {
+          const { changes } = db.run(sql, ...params);
+          const id = db.get<{ id: number | bigint }>("SELECT last_insert_rowid() AS id");
+          return { changes, lastInsertRowid: Number(id?.id ?? 0) };
+        },
+      };
+    },
+    exec(sql: string) {
+      db.exec(sql);
+    },
+    close() {
+      db.close();
+    },
+  };
+  return facade as unknown as DatabaseSync;
 }

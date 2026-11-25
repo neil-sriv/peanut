@@ -14,13 +14,18 @@
     "./anchors/whole": "./src/anchors/whole.ts"
   },
   "scripts": {
-    "test": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.ts\"",
+    "test": "npm run test:node && npm run test:do",
+    "test:node": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.ts\"",
+    "test:do": "vitest run --config vitest.config.ts",
     "typecheck": "tsc"
   },
   "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.9.2",
     "@types/markdown-it": "14.2.0",
     "@types/node": "24.19.2",
     "markdown-it": "15.0.3",
-    "typescript": "7.0.2"
+    "typescript": "7.0.2",
+    "vitest": "^4.1.12",
+    "wrangler": "^4.168.0"
   }
 }
